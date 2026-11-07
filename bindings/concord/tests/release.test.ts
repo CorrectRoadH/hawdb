@@ -61,7 +61,15 @@ class Host implements ReleaseHost {
   expired = false;
   creates = 0;
   publications = 0;
-  async find() { return this.remote ? structuredClone(this.remote) : undefined; }
+  missingAfterCreate = 0;
+  missingAfterPublish = 0;
+  finds = 0;
+  async find() {
+    this.finds++;
+    if (this.remote?.draft && this.missingAfterCreate-- > 0) return undefined;
+    if (this.remote && !this.remote.draft && this.missingAfterPublish-- > 0) return undefined;
+    return this.remote ? structuredClone(this.remote) : undefined;
+  }
   async create(tag: string, _producer: string, body: string) {
     this.creates++;
     this.remote = { id: 1, tag_name: tag, draft: true, prerelease: true, body, assets: [] };
@@ -126,6 +134,74 @@ test('lost draft creation response recovers by original provenance', async () =>
     await assert.rejects(publishFrozen(host, f.candidate, frozen), /lost create response/u);
     await publishFrozen(host, f.candidate, frozen);
     assert.equal(host.creates, 1);
+  } finally { await f.cleanup(); }
+});
+for (const phase of ['create', 'publish'] as const) {
+  test(`briefly missing release after ${phase} is reread without repeating mutations`, async () => {
+    const f = await fixture(); const host = new Host();
+    try {
+      if (phase === 'create') host.missingAfterCreate = 1;
+      else host.missingAfterPublish = 1;
+      await publishFrozen(host, f.candidate, frozen);
+      assert.equal(host.finds, 5);
+      assert.equal(host.creates, 1);
+      assert.equal(host.uploads, 6);
+      assert.equal(host.publications, 1);
+      assert.equal(host.remote?.draft, false);
+    } finally { await f.cleanup(); }
+  });
+  test(`persistently missing release after ${phase} fails within five reads and original candidate recovers`, async () => {
+    const f = await fixture(); const host = new Host();
+    try {
+      if (phase === 'create') host.missingAfterCreate = Infinity;
+      else host.missingAfterPublish = Infinity;
+      await assert.rejects(publishFrozen(host, f.candidate, frozen), phase === 'create' ? /DraftCreationUncertain/u : /PublicationUncertain/u);
+      assert.equal(host.finds, phase === 'create' ? 6 : 8);
+      assert.equal(host.creates, 1);
+      assert.equal(host.uploads, phase === 'create' ? 0 : 6);
+      assert.equal(host.publications, phase === 'create' ? 0 : 1);
+      host.missingAfterCreate = 0; host.missingAfterPublish = 0;
+      await publishFrozen(host, f.candidate, frozen);
+      await publishFrozen(host, f.candidate, frozen);
+      assert.equal(host.creates, 1);
+      assert.equal(host.uploads, 6);
+      assert.equal(host.publications, 1);
+    } finally { await f.cleanup(); }
+  });
+}
+test('readback errors and conflicting provenance after creation fail without retrying mutations', async () => {
+  const f = await fixture();
+  try {
+    for (const mode of ['error', 'conflict'] as const) {
+      const host = new Host();
+      if (mode === 'conflict') host.missingAfterCreate = 1;
+      const find = host.find.bind(host);
+      let readbacks = 0;
+      host.find = async () => {
+        if (host.creates > 0) readbacks++;
+        if (host.creates > 0 && mode === 'error') throw new Error('readback HTTP 403');
+        const remote = await find();
+        return remote && mode === 'conflict' ? { ...remote, body: provenanceBody({ ...frozen, runId: '999' }) } : remote;
+      };
+      await assert.rejects(publishFrozen(host, f.candidate, frozen), mode === 'error' ? /readback HTTP 403/u : /DraftFrozenCandidateMismatch/u);
+      assert.equal(readbacks, mode === 'error' ? 1 : 2);
+      assert.equal(host.finds, mode === 'error' ? 1 : 3);
+      assert.equal(host.creates, 1);
+      assert.equal(host.uploads, 0);
+      assert.equal(host.publications, 0);
+    }
+  } finally { await f.cleanup(); }
+});
+test('lost publication response is not retried and the original candidate reuses the public bytes', async () => {
+  const f = await fixture(); const host = new Host();
+  try {
+    const publish = host.publish.bind(host);
+    host.publish = async () => { await publish(); throw new Error('lost publish response'); };
+    await assert.rejects(publishFrozen(host, f.candidate, frozen), /lost publish response/u);
+    await publishFrozen(host, f.candidate, frozen);
+    assert.equal(host.creates, 1);
+    assert.equal(host.uploads, 6);
+    assert.equal(host.publications, 1);
   } finally { await f.cleanup(); }
 });
 test('different run, missing provenance, expired artifact and conflicting assets fail closed', async () => {

@@ -17,6 +17,7 @@
 import { appendFile, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
+import { setTimeout } from 'node:timers/promises';
 import { Effect, Schema } from 'effect';
 import { NodeRuntime, NodeServices } from '@effect/platform-node';
 import { decodeRelease, releaseFiles, repository, stableVersion, upstream, revision as revisionSchema, digest as digestSchema, type Release } from './contract.ts';
@@ -33,6 +34,16 @@ export interface ReleaseHost {
   upload(tag: string, path: string): Promise<void>;
   publish(tag: string): Promise<void>;
   artifact(id: string): Promise<{ expired: boolean; digest: string; runId: string }>;
+}
+async function findAfterMutation(host: ReleaseHost, tag: string): Promise<RemoteRelease | undefined> {
+  // GitHub's release list may briefly omit a successful create or publication.
+  // Retry only absence, never an error, conflicting identity, or the mutation.
+  for (let attempt = 0; attempt < 5; attempt++) {
+    if (attempt > 0) await setTimeout(1000);
+    const remote = await host.find(tag);
+    if (remote) return remote;
+  }
+  return undefined;
 }
 export const provenanceBody = (f: Frozen): string => `Concord native binaries. Frozen candidate; do not replace assets.\n\n<!-- concord-frozen/v1\n${JSON.stringify(f)}\n-->\n`;
 export function parseProvenance(body: string | null): Frozen {
@@ -80,7 +91,7 @@ export async function publishFrozen(host: ReleaseHost, directory: string, frozen
   if (!remote) {
     // If the create response is lost, the next invocation finds the draft.
     await host.create(r.tag, r.producerCommit, provenanceBody(frozen));
-    remote = await host.find(r.tag);
+    remote = await findAfterMutation(host, r.tag);
     if (!remote) throw new Error('DraftCreationUncertain: rerun original publish job');
   }
   if (JSON.stringify(parseProvenance(remote.body)) !== JSON.stringify(frozen)) throw new Error('DraftFrozenCandidateMismatch: rerun original publish job');
@@ -103,7 +114,7 @@ export async function publishFrozen(host: ReleaseHost, directory: string, frozen
       if (await shaFile(join(temp, name)) !== await shaFile(join(directory, name))) throw new Error(`ReleaseAssetConflict: ${name}`);
     }
     await host.publish(r.tag);
-    const published = await host.find(r.tag);
+    const published = await findAfterMutation(host, r.tag);
     if (!published) throw new Error('PublicationUncertain');
     await verifyPublic(host, published, r.version, r.revision);
   } finally { await rm(temp, { recursive: true, force: true }); }

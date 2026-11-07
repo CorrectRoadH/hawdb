@@ -88,8 +88,12 @@ source digest, artifact ID and GitHub artifact digest. Publishing creates a draf
 prerelease, compares every existing same-name asset without overwriting it,
 appends only missing files, downloads and verifies all six remote assets, then
 makes the prerelease public. Lost create/upload responses are recoverable by
-rerunning the original publish job. Unexpected assets, mismatched provenance or
-different bytes fail closed. Expired/deleted original artifacts produce a named
+rerunning the original publish job. After successful creation or publication,
+an absent release-list result is reread up to five times total, one second apart.
+Only reads are retried; read errors and visible identity conflicts fail immediately.
+Persistent absence still requires recovery through the original publish job.
+Unexpected assets, mismatched provenance or different bytes fail closed.
+Expired/deleted original artifacts produce a named
 failure; there is no automatic rebuild, replacement or invented version.
 
 If the original artifact expires, maintainers must resolve the release incident
