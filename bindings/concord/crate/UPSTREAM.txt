@@ -1,0 +1,5 @@
+HawDB https://github.com/nowledge-co/hawdb.git
+version 0.28.0
+revision d47dd9b2b6a51c57a8a621367f5ff6d5d958b3e6
+license Apache-2.0
+The release artifact includes HawDB's LICENSE as HAWDB-LICENSE.txt.

@@ -6,6 +6,21 @@ authoritative; this is a map of test families, not an exhaustive list of every
 Rust test function. Update it when changing a family's scope, build profile,
 execution lane, fixture size, isolation or known failure mode.
 
+Concord's independent N-API producer is owned by
+[`bindings/concord/tests/native.test.ts`](../bindings/concord/README.md) and
+`tests/release.test.ts` in that package. These are private producer tests, outside
+the engine Cargo/Bazel graph. `release-binaries` owns the dedicated Ubuntu 24.04
+x64 glibc and macOS 15 arm64 lanes, production plus test-hooks, with identical
+repository-wide Cargo profiles. Each lane tests the final archived/extracted
+bytes under Node 26.13.0 and Bun 1.4.2; hook acceptance includes transaction
+rollback, cross-process/raw/deferred ownership and SIGKILL recovery without
+skips. Release-state tests use real archives and stub only GitHub custody, proving
+partial upload recovery, immutable asset conflicts and original-artifact expiry.
+The README gives exact local replay and mode commands. The first release build
+compiles an independent pinned engine dependency; record that cold build cost
+separately from native execution and do not infer hosted CI speed from local Nix.
+No ordinary engine CI or fuzz lane includes this package.
+
 Mem query-shaped compatibility (`nowledge-co/mem#9338`) is owned by
 `api::tests::mem_query_contract` in `//:hawdb_unit_general_tests` (the existing
 required native general lane). The finite fixtures cover C1-C5 execution,

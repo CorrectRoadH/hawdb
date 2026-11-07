@@ -1,0 +1,254 @@
+name: release-binaries
+
+on:
+  schedule:
+    - cron: '19 * * * *'
+  workflow_dispatch:
+    inputs:
+      upstream_version:
+        description: 'Official upstream semver (minimum 0.28.0); empty selects latest stable'
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+# Serialize selection as well as publication, including scheduled/manual races.
+concurrency:
+  group: concord-hawdb-release-binaries
+  cancel-in-progress: false
+
+jobs:
+  preflight:
+    if: github.repository == 'CorrectRoadH/hawdb' && github.ref == 'refs/heads/main'
+    permissions:
+      contents: read
+      actions: read
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    outputs:
+      version: ${{ steps.select.outputs.version }}
+      revision: ${{ steps.select.outputs.revision }}
+      build: ${{ steps.select.outputs.build }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: CorrectRoadH/hawdb
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.18.0
+          package_json_file: bindings/concord/package.json
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 26.13.0
+      - run: pnpm --dir bindings/concord install --frozen-lockfile --ignore-scripts
+      - id: select
+        name: Validate upstream and reuse a complete published version before building
+        env:
+          GH_TOKEN: ${{ github.token }}
+          UPSTREAM_VERSION: ${{ inputs.upstream_version }}
+        run: node bindings/concord/release.ts preflight
+
+  prepare:
+    needs: preflight
+    if: needs.preflight.outputs.build == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    outputs:
+      source_digest: ${{ steps.prepare.outputs.sourceDigest }}
+      cargo_lock_digest: ${{ steps.prepare.outputs.cargoLockDigest }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: CorrectRoadH/hawdb
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.18.0
+          package_json_file: bindings/concord/package.json
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 26.13.0
+      - run: pnpm --dir bindings/concord install --frozen-lockfile --ignore-scripts
+      - run: rustup toolchain install 1.97.1 --profile minimal --component rustfmt --component clippy
+      - id: prepare
+        name: Resolve one build copy and lock for both platforms
+        env:
+          ENGINE_VERSION: ${{ needs.preflight.outputs.version }}
+          ENGINE_REVISION: ${{ needs.preflight.outputs.revision }}
+          PRODUCER_COMMIT: ${{ github.sha }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$PRODUCER_COMMIT"
+          node bindings/concord/prepare.ts "$ENGINE_VERSION" "$ENGINE_REVISION" "$PRODUCER_COMMIT"
+          tar --exclude=node_modules --exclude=target --exclude=dist --exclude=work -czf "$RUNNER_TEMP/prepared.tar.gz" bindings/concord
+      - uses: actions/upload-artifact@v4
+        with:
+          name: concord-hawdb-prepared
+          path: ${{ runner.temp }}/prepared.tar.gz
+          if-no-files-found: error
+          retention-days: 30
+
+  build:
+    needs: [preflight, prepare]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: linux-x64-glibc
+          # Standard public Apple Silicon runner; build refuses any other host.
+          - os: macos-15
+            target: darwin-arm64
+    env:
+      MACOSX_DEPLOYMENT_TARGET: '15.0'
+      CARGO_BUILD_JOBS: '3'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: CorrectRoadH/hawdb
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: concord-hawdb-prepared
+          path: ${{ runner.temp }}/prepared
+      - run: |
+          tar -xzf "$RUNNER_TEMP/prepared/prepared.tar.gz"
+          echo "CARGO_TARGET_DIR=$RUNNER_TEMP/hawdb-cargo" >> "$GITHUB_ENV"
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.18.0
+          package_json_file: bindings/concord/package.json
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 26.13.0
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - run: pnpm --dir bindings/concord install --frozen-lockfile --ignore-scripts
+      - run: rustup toolchain install 1.97.1 --profile minimal --component rustfmt --component clippy
+      - name: Check immutable prepared source and bridge
+        run: |
+          node --input-type=module -e 'import { sourceDigest } from "./bindings/concord/prepare.ts"; import { readFile } from "node:fs/promises"; import assert from "node:assert/strict"; import { shaFile } from "./bindings/concord/io.ts"; const identity = JSON.parse(await readFile("bindings/concord/identity.json", "utf8")); assert.equal(await sourceDigest(), identity.sourceDigest); assert.equal(await shaFile("bindings/concord/crate/Cargo.lock"), identity.cargoLockDigest);'
+          pnpm --dir bindings/concord typecheck
+          pnpm --dir bindings/concord test
+          cargo fmt --manifest-path bindings/concord/crate/Cargo.toml --all -- --check
+          cargo clippy --locked --manifest-path bindings/concord/crate/Cargo.toml --workspace --all-targets --all-features -- -D warnings
+      - name: Build, sign, archive, then test final extracted bytes in both runtimes
+        env:
+          NATIVE_TARGET: ${{ matrix.target }}
+        run: |
+          for mode in production hooks; do
+            hooks_arg=''
+            suffix=''
+            selected='0'
+            if [ "$mode" = hooks ]; then hooks_arg='--test-hooks'; suffix='-test-hooks'; selected='1'; fi
+            node bindings/concord/build.ts "$RUNNER_TEMP/$mode" $hooks_arg
+            node bindings/concord/archive.ts pack "$RUNNER_TEMP/$mode" "$RUNNER_TEMP/archives" "$NATIVE_TARGET" "$mode"
+            node bindings/concord/archive.ts extract "$RUNNER_TEMP/archives/hawdb-$NATIVE_TARGET$suffix.tar.gz" "$RUNNER_TEMP/extracted-$mode" "$NATIVE_TARGET"
+            NATIVE_ARTIFACT_ROOT="$RUNNER_TEMP/extracted-$mode" NATIVE_TEST_HOOKS="$selected" node --test bindings/concord/tests/native.test.ts
+            NATIVE_ARTIFACT_ROOT="$RUNNER_TEMP/extracted-$mode" NATIVE_TEST_HOOKS="$selected" bun test --no-env-file --config=/dev/null --timeout=300000 ./bindings/concord/tests/native.test.ts
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: concord-hawdb-${{ matrix.target }}
+          path: ${{ runner.temp }}/archives/*.tar.gz
+          if-no-files-found: error
+          retention-days: 30
+
+  freeze:
+    needs: [preflight, prepare, build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    outputs:
+      artifact_id: ${{ steps.freeze.outputs.artifact-id }}
+      artifact_digest: ${{ steps.freeze.outputs.artifact-digest }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: CorrectRoadH/hawdb
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.18.0
+          package_json_file: bindings/concord/package.json
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 26.13.0
+      - run: pnpm --dir bindings/concord install --frozen-lockfile --ignore-scripts
+      - uses: actions/download-artifact@v4
+        with:
+          name: concord-hawdb-prepared
+          path: ${{ runner.temp }}/prepared
+      - name: Read identity only; never execute prepared artifact code
+        run: |
+          tar -xOzf "$RUNNER_TEMP/prepared/prepared.tar.gz" bindings/concord/identity.json > "$RUNNER_TEMP/identity.json"
+          cp "$RUNNER_TEMP/identity.json" bindings/concord/identity.json
+      - uses: actions/download-artifact@v4
+        with:
+          name: concord-hawdb-linux-x64-glibc
+          path: ${{ runner.temp }}/archives
+      - uses: actions/download-artifact@v4
+        with:
+          name: concord-hawdb-darwin-arm64
+          path: ${{ runner.temp }}/archives
+      - run: node bindings/concord/archive.ts assemble "$RUNNER_TEMP/archives" "$RUNNER_TEMP/candidate"
+      - id: freeze
+        uses: actions/upload-artifact@v4
+        with:
+          name: concord-hawdb-frozen-${{ needs.preflight.outputs.version }}
+          path: ${{ runner.temp }}/candidate/*
+          if-no-files-found: error
+          retention-days: 90
+          overwrite: false
+
+  publish:
+    needs: [preflight, prepare, freeze]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      # Only this trusted workflow commit supplies executable publishing code.
+      - uses: actions/checkout@v4
+        with:
+          repository: CorrectRoadH/hawdb
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.18.0
+          package_json_file: bindings/concord/package.json
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 26.13.0
+      - run: pnpm --dir bindings/concord install --frozen-lockfile --ignore-scripts
+      - name: Refuse expired or deleted original custody before download
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FROZEN_ARTIFACT_ID: ${{ needs.freeze.outputs.artifact_id }}
+          FROZEN_ARTIFACT_DIGEST: ${{ needs.freeze.outputs.artifact_digest }}
+        run: node bindings/concord/release.ts check-frozen
+      - uses: actions/download-artifact@v4
+        with:
+          artifact-ids: ${{ needs.freeze.outputs.artifact_id }}
+          path: ${{ runner.temp }}/candidate
+          merge-multiple: true
+      - name: Append missing frozen assets, verify all remote bytes, then publish prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EXPECTED_VERSION: ${{ needs.preflight.outputs.version }}
+          EXPECTED_REVISION: ${{ needs.preflight.outputs.revision }}
+          EXPECTED_PRODUCER_COMMIT: ${{ github.sha }}
+          EXPECTED_SOURCE_DIGEST: ${{ needs.prepare.outputs.source_digest }}
+          EXPECTED_CARGO_LOCK_DIGEST: ${{ needs.prepare.outputs.cargo_lock_digest }}
+          FROZEN_ARTIFACT_ID: ${{ needs.freeze.outputs.artifact_id }}
+          FROZEN_ARTIFACT_DIGEST: ${{ needs.freeze.outputs.artifact_digest }}
+        run: node bindings/concord/release.ts publish "$RUNNER_TEMP/candidate"
