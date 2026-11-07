@@ -16,6 +16,7 @@ bytes under Node 26.13.0 and Bun 1.4.2; hook acceptance includes transaction
 rollback, cross-process/raw/deferred ownership and SIGKILL recovery without
 skips. Release-state tests use real archives and stub only GitHub custody, proving
 partial upload recovery, immutable asset conflicts and original-artifact expiry.
+The package also checks real subprocess working-directory and output-limit behavior.
 The README gives exact local replay and mode commands. The first release build
 compiles an independent pinned engine dependency; record that cold build cost
 separately from native execution and do not infer hosted CI speed from local Nix.

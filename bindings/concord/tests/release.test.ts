@@ -16,6 +16,8 @@
 
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
+import { Effect } from 'effect';
+import { NodeServices } from '@effect/platform-node';
 import { mkdtemp, mkdir, readFile, writeFile, rm, symlink } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, basename, dirname } from 'node:path';
@@ -23,10 +25,15 @@ import * as tar from 'tar';
 import { abi, combinations, decodeArtifact, decodeRelease, releaseFiles, stableVersion, type Identity } from '../contract.ts';
 import { assemble, extractArchive, licenseDigests, pack, validateReleaseDirectory } from '../archive.ts';
 import { publishFrozen, provenanceBody, verifyPublic, selectUpstream, preflightRelease, type Frozen, type ReleaseHost, type RemoteRelease } from '../release.ts';
-import { root, shaFile } from '../io.ts';
+import { command, root, shaFile } from '../io.ts';
 import { sourceDigest, sourceFiles } from '../prepare.ts';
 const identity: Identity = { version: '0.28.0', revision: 'a'.repeat(40), producerCommit: 'b'.repeat(40), sourceDigest: 'c'.repeat(64), cargoLockDigest: 'd'.repeat(64) };
 const frozen: Frozen = { runId: '123', artifactId: '456', artifactDigest: 'e'.repeat(64), producerCommit: identity.producerCommit, sourceDigest: identity.sourceDigest };
+test('producer commands retain their working directory with an explicit stdout bound', async () => {
+  const run = (script: string, limit: number) => Effect.runPromise(command(process.execPath, ['-e', script], limit).pipe(Effect.provide(NodeServices.layer)));
+  assert.equal(await run('process.stdout.write(process.cwd())', 32 * 1024 * 1024), root);
+  await assert.rejects(run('process.stdout.write("over limit")', 3), /output limit/u);
+});
 async function fixture() {
   const dir = await mkdtemp(join(tmpdir(), 'hawdb-publish-test-'));
   const archives = join(dir, 'archives'), candidate = join(dir, 'candidate');

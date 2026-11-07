@@ -26,9 +26,9 @@ export class ProducerFailed extends Schema.TaggedError<ProducerFailed>()('Produc
 }
 export const failure = (error: unknown): ProducerFailed => new ProducerFailed({ detail: error instanceof Error ? error.message : String(error) });
 export const attempt = <A>(f: () => Promise<A>) => Effect.tryPromise({ try: f, catch: failure });
-export const command = Effect.fn('producer.command')(function*(name: string, args: readonly string[], cwd = root, limit = 64 * 1024 * 1024) {
+export const command = Effect.fn('producer.command')(function*(name: string, args: readonly string[], limit = 64 * 1024 * 1024) {
   const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
-  const child = yield* spawner.spawn(ChildProcess.make(name, args, { cwd, stderr: 'inherit' }));
+  const child = yield* spawner.spawn(ChildProcess.make(name, args, { cwd: root, stderr: 'inherit' }));
   let bytes = 0;
   const output = child.stdout.pipe(Stream.mapEffect(chunk => {
     bytes += chunk.byteLength;
