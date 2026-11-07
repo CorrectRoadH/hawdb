@@ -17,7 +17,7 @@
 // Loads only the final extracted artifact. No Cargo or Concord dependency.
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { spawn, type ChildProcess } from 'node:child_process';
+import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
 import { createRequire } from 'node:module';
 import { mkdtempSync, realpathSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, linkSync, writeFileSync, existsSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -63,6 +63,14 @@ function rawEngine(path: string, admit = true): RawDatabase {
 const childRole = process.env.CONCORD_HAWDB_CHILD_ROLE;
 if (childRole) {
   const path = process.env.CONCORD_HAWDB_CHILD_PATH!;
+  if (childRole === 'fail-batch') {
+    const db = openHawdb(path, { readOnly: false, create: false }, runtime);
+    try {
+      assert.throws(() => db.put('code_cache', [{ key: 'first', payload: '1' }, { key: 'second', payload: '2' }]), /HawdbUnavailable:/u);
+      assert.deepEqual(db.scan('code_cache'), []);
+    } finally { db.close(); }
+    process.exit(0);
+  }
   if (childRole === 'kill-batch') {
     const db = openHawdb(path, { readOnly: false, create: false }, runtime);
     db.put('code_cache', [{ key: 'precommit', payload: 'not-visible' }]);
@@ -315,11 +323,12 @@ if (childRole) {
   if (hooks) test('test-hook failure inside real transaction rolls back all SQL mutations', () => {
     const f = fixture();
     try {
-      const db = openHawdb(f.db, { readOnly: false, create: true }, runtime);
-      process.env.CONCORD_HAWDB_TEST_FAIL_AFTER_FIRST = '1';
-      try { code(() => db.put('code_cache', [{ key: 'first', payload: '1' }, { key: 'second', payload: '2' }]), 'HawdbUnavailable'); }
-      finally { delete process.env.CONCORD_HAWDB_TEST_FAIL_AFTER_FIRST; }
-      assert.deepEqual(db.scan('code_cache'), []); db.close();
+      const db = openHawdb(f.db, { readOnly: false, create: true }, runtime); db.close();
+      const result = spawnSync(process.execPath, [fileURLToPath(import.meta.url)], {
+        env: { ...process.env, CONCORD_HAWDB_CHILD_ROLE: 'fail-batch', CONCORD_HAWDB_CHILD_PATH: f.db, CONCORD_HAWDB_TEST_FAIL_AFTER_FIRST: '1' },
+        encoding: 'utf8', timeout: 30_000,
+      });
+      assert.equal(result.status, 0, result.stdout + result.stderr);
       const reopened = openHawdb(f.db, { readOnly: true, create: false }, runtime);
       assert.deepEqual(reopened.scan('code_cache'), []); reopened.close();
     } finally { f.cleanup(); }
