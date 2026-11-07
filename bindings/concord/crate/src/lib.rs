@@ -134,6 +134,7 @@ fn namespaces(memory: bool) -> &'static [&'static str] {
 fn config(read_only: bool) -> DatabaseConfig {
     DatabaseConfig {
         read_only,
+        recovery_mode: hawdb::RecoveryMode::Strict,
         max_read_result_rows: Some(20_000),
         max_read_result_payload_bytes: Some(64 * MIB),
         max_wal_replay_entries: Some(100_000),

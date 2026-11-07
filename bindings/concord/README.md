@@ -11,6 +11,8 @@ inodes, and the full-handle coordination lease. The initial engine is canonical 
 `v0.28.0`, commit `d47dd9b2b6a51c57a8a621367f5ff6d5d958b3e6`, with default
 features disabled. N-API dependencies and libc are exact pins. Engine API drift
 must fail compilation or behavioral acceptance; it is never assumed compatible.
+Both read-only and writable opens explicitly select strict recovery; upstream
+defaults cannot enable automatic WAL repair or prevent existing-only reads.
 
 ## Release ownership
 
