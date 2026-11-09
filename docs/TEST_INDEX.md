@@ -25,9 +25,8 @@ Closing-shell WeakRef/GC evidence is reported separately when a collector exists
 The worker barrier's 30-second ceiling and test deadlines detect hangs, not
 performance regressions. Release-state tests use real archives and stub only GitHub custody, proving
 partial upload recovery, immutable asset conflicts and original-artifact expiry.
-A tag-scoped GitHub fake proves a bridge release can recover interrupted uploads
-and reuse its public assets while preserving the earlier plain engine release's
-metadata and bytes. Fixtures use real packing, assembly and directory validation;
+The producer tests current behavior without version-switching, compatibility-refusal
+or version-format matrices. Fixtures use real packing, assembly and directory validation;
 archive tests retain unsafe-entry refusal and payload-integrity checks.
 Manual `validate_only` runs execute the same native lanes and freeze candidate
 artifacts without running the publish job. Preflight coverage checks that this

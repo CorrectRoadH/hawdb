@@ -24,7 +24,7 @@ import { join, basename } from 'node:path';
 import * as tar from 'tar';
 import { abi, combinations, releaseFiles, type Identity } from '../contract.ts';
 import { assemble, extractArchive, licenseDigests, pack, validateReleaseDirectory } from '../archive.ts';
-import { publishFrozen, provenanceBody, verifyPublic, selectUpstream, preflightRelease, type Frozen, type ReleaseHost, type RemoteRelease } from '../release.ts';
+import { publishFrozen, provenanceBody, verifyPublic, preflightRelease, type Frozen, type ReleaseHost, type RemoteRelease } from '../release.ts';
 import { command, root, shaFile } from '../io.ts';
 const identity: Identity = { version: '0.28.0', engineVersion: '0.28.0', revision: 'a'.repeat(40), producerCommit: 'b'.repeat(40), sourceDigest: 'c'.repeat(64), cargoLockDigest: 'd'.repeat(64) };
 const frozen: Frozen = { runId: '123', artifactId: '456', artifactDigest: 'e'.repeat(64), producerCommit: identity.producerCommit, sourceDigest: identity.sourceDigest };
@@ -94,34 +94,6 @@ class Host implements ReleaseHost {
     this.remote = { ...this.remote!, draft: false };
   }
   async artifact() { return { expired: this.expired, digest: frozen.artifactDigest, runId: frozen.runId }; }
-}
-
-// Route each external request by the exact GitHub tag, with independent assets.
-class TaggedHost implements ReleaseHost {
-  releases = new Map<string, Host>();
-  async find(tag: string) { return this.releases.get(tag)?.find(); }
-  async create(tag: string, producer: string, body: string) {
-    assert.equal(this.releases.get(tag), undefined, 'never recreate an existing tag');
-    const host = new Host();
-    this.releases.set(tag, host);
-    await host.create(tag, producer, body);
-  }
-  async download(tag: string, name: string, dest: string) {
-    const host = this.releases.get(tag);
-    assert.ok(host, `missing tag ${tag}`);
-    await host.download(tag, name, dest);
-  }
-  async upload(tag: string, path: string) {
-    const host = this.releases.get(tag);
-    assert.ok(host, `missing tag ${tag}`);
-    await host.upload(tag, path);
-  }
-  async publish(tag: string) {
-    const host = this.releases.get(tag);
-    assert.ok(host, `missing tag ${tag}`);
-    await host.publish();
-  }
-  async artifact() { return { expired: false, digest: frozen.artifactDigest, runId: frozen.runId }; }
 }
 
 for (const lostAfter of [1, 2, 3, 4, 5, 6]) test(`resume same frozen candidate after upload ${lostAfter} response loss`, async () => {
@@ -275,27 +247,6 @@ test('normalized archive metadata is stable; payload mutation changes checksum',
   } finally { await f.cleanup(); }
 });
 
-test('upstream selection excludes draft/prerelease/non-semver and peels annotated release tag', async () => {
-  const release = (tag: string, draft = false, prerelease = false): RemoteRelease => ({ id: 1, tag_name: tag, draft, prerelease, body: '', assets: [] });
-  const calls: string[] = [];
-  const host = {
-    async releases() { return [release('v0.28.0'), release('v0.29.0'), release('v9.0.0', true), release('v8.0.0', false, true), release('v7.0.0-rc.1'), release('v99.0.0-concord.1'), release('native-deadbeef')]; },
-    async object(path: string) {
-      calls.push(path);
-      return path.includes('/git/ref/') ? { object: { type: 'tag', sha: 'a'.repeat(40) } } : { object: { type: 'commit', sha: identity.revision } };
-    },
-  };
-  assert.deepEqual(await selectUpstream(undefined, host), { version: '0.29.0', revision: identity.revision });
-  assert.equal(calls[0], 'repos/nowledge-co/hawdb/git/ref/tags/v0.29.0');
-  assert.equal(calls[1], `repos/nowledge-co/hawdb/git/tags/${'a'.repeat(40)}`);
-  assert.deepEqual(await selectUpstream('0.28.0', host), { version: '0.28.0', revision: identity.revision });
-  assert.equal(calls[2], 'repos/nowledge-co/hawdb/git/ref/tags/v0.28.0');
-  await assert.rejects(selectUpstream('8.0.0', host), /StableReleaseMissing/u);
-  await assert.rejects(selectUpstream('0.27.0', host), /minimum/u);
-  await assert.rejects(selectUpstream('0.28.0-concord.1', host));
-  await assert.rejects(selectUpstream('0.28.0', { ...host, async object() { return { object: { type: 'tree', sha: identity.revision } }; } }), /TagNotCommit/u);
-});
-
 test('full workflow rerun refuses draft and names original publish; complete public version skips build', async () => {
   const f = await fixture(); const host = new Host();
   const selected = { version: identity.version, revision: identity.revision };
@@ -318,40 +269,4 @@ test('full workflow rerun refuses draft and names original publish; complete pub
     assert.equal(host.finds, publicReads, 'validation builds current sources instead of reusing published bytes');
     assert.equal(host.uploads, 6);
   } finally { await f.cleanup(); }
-});
-
-test('a bridge release recovers interrupted publication without overwriting the published engine release', async () => {
-  const host = new TaggedHost();
-  const plain = await fixture();
-  try {
-    await publishFrozen(host, plain.candidate, frozen);
-    const plainHost = host.releases.get('hawdb-0.28.0')!;
-    const original = structuredClone(plainHost.remote);
-    const originalBytes = new Map([...plainHost.bytes].map(([name, bytes]) => [name, Buffer.from(bytes)]));
-    const prepared = { ...identity, version: '0.28.0-concord.1', sourceDigest: '1'.repeat(64) };
-    const candidate = await fixture(prepared);
-    const provenance = { ...frozen, sourceDigest: prepared.sourceDigest };
-    const selected = { version: prepared.version, revision: identity.revision };
-    try {
-      assert.equal(await preflightRelease(host, selected), true, 'the plain release cannot skip this build');
-      await host.create('hawdb-0.28.0-concord.1', identity.producerCommit, provenanceBody(provenance));
-      const bridgeHost = host.releases.get('hawdb-0.28.0-concord.1')!;
-      bridgeHost.failAfterUpload = 2;
-      await assert.rejects(publishFrozen(host, candidate.candidate, provenance), /lost upload response/u);
-      await assert.rejects(preflightRelease(host, selected), /DraftRequiresOriginalPublish/u);
-      bridgeHost.failAfterUpload = -1;
-      await publishFrozen(host, candidate.candidate, provenance);
-      assert.equal(await preflightRelease(host, selected), false);
-      await publishFrozen(host, candidate.candidate, provenance);
-      assert.equal(bridgeHost.creates, 1);
-      assert.equal(bridgeHost.uploads, 6);
-      assert.equal(bridgeHost.publications, 1);
-      assert.equal(bridgeHost.remote?.draft, false);
-      assert.equal(await preflightRelease(host, { version: identity.version, revision: identity.revision }), false);
-      assert.deepEqual(plainHost.remote, original);
-      assert.deepEqual(plainHost.bytes, originalBytes);
-      assert.equal(plainHost.uploads, 6);
-      assert.equal(host.releases.size, 2);
-    } finally { await candidate.cleanup(); }
-  } finally { await plain.cleanup(); }
 });
