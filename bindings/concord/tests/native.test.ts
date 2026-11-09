@@ -19,6 +19,7 @@ import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
 import { createRequire } from 'node:module';
+import { createConnection, createServer } from 'node:net';
 import { mkdtempSync, realpathSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, linkSync, writeFileSync, existsSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -30,10 +31,12 @@ interface Entry { key: string; payload: string }
 interface Database {
   put(namespace: string, entries: Entry[], quota?: { maxEntries: number; maxBytes: number }): void;
   get(namespace: string, keys: string[]): Entry[];
-  scan(namespace: string): Entry[]; namespaces(): string[]; close(): void;
+  clearNamespace(namespace: string): void; reclaim(): unknown;
+  scan(namespace: string): Entry[]; namespaces(): string[]; close(): void; closeAsync(): Promise<void>;
 }
 interface Guard { verify(): void; close(): void }
 interface Native {
+  openCache(path: string, readOnly: boolean, create: boolean): Promise<Database>;
   CacheBridge: { new(path: string, readOnly: boolean, create: boolean): Database; memory(): Database; uncoordinatedForTest?: (path: string, readOnly: boolean, admit: boolean) => RawDatabase };
   OwnerGuard: new(path: string) => Guard;
   nativeIdentity(): { revision: string; abi: string };
@@ -60,9 +63,121 @@ function rawEngine(path: string, admit = true): RawDatabase {
   return native.CacheBridge.uncoordinatedForTest(path, true, admit);
 }
 
+async function waitForMarker(path: string): Promise<void> {
+  const deadline = Date.now() + 15_000;
+  while (!existsSync(path)) {
+    assert.ok(Date.now() < deadline, `native lifecycle marker missing: ${path}`);
+    await new Promise(resolve => setTimeout(resolve, 10));
+  }
+}
+
+async function lifecycleChild(role: string, path: string): Promise<void> {
+  if (role === 'lifecycle-failure') {
+    const failure = process.env.CONCORD_HAWDB_LIFECYCLE_FAILURE;
+    if (failure === 'close-submit-failure') {
+      const db = await native.openCache(path, false, false);
+      assert.throws(() => db.closeAsync(), /HawdbUnavailable:/u);
+      assert.throws(() => db.get('config_cache', ['async']), /HawdbClosed:/u);
+    } else if (failure === 'open-unsettled') {
+      // Simulates destruction before custody handoff, not a real N-API settlement error.
+      const shell = await native.openCache(path, false, false);
+      assert.throws(() => shell.get('config_cache', ['async']), /HawdbClosed:/u);
+    } else {
+      await assert.rejects(native.openCache(path, false, false), /HawdbUnavailable:/u);
+    }
+    // Check in the failing process, before its exit can release any leaked lock.
+    const guard = acquireHawdbClearGuard(path, runtime); guard.verify(); guard.close();
+    const reopened = openHawdb(path, { readOnly: true, create: false }, runtime);
+    try { assert.deepEqual(reopened.get('config_cache', ['async']), [{ key: 'async', payload: 'durable' }]); }
+    finally { reopened.close(); }
+    process.stdout.write('DRAINED\n');
+    return;
+  }
+
+  const ready = process.env.CONCORD_HAWDB_LIFECYCLE_READY!;
+  const release = process.env.CONCORD_HAWDB_LIFECYCLE_RELEASE!;
+  let settled = false;
+  let completion: Promise<Database | void>;
+  let weak: WeakRef<Database> | undefined;
+  let closingDb: Database | undefined;
+  if (role === 'lifecycle-open') {
+    completion = native.openCache(path, false, false);
+  } else {
+    closingDb = openHawdb(path, { readOnly: false, create: false }, runtime);
+    closingDb.put('config_cache', [{ key: 'async', payload: 'durable' }]);
+    weak = new WeakRef(closingDb);
+    completion = closingDb.closeAsync();
+  }
+  // Observe rejection immediately as well as awaiting it below.
+  void completion.then(() => { settled = true; }, () => { settled = true; });
+  await waitForMarker(ready);
+  assert.equal(settled, false, 'native work must still be pending at the barrier');
+  assert.equal(existsSync(release), false);
+  if (closingDb) {
+    // Exercise methods after the worker has taken its resources, while it is paused.
+    for (const operation of [
+      () => closingDb!.get('config_cache', ['async']), () => closingDb!.scan('config_cache'),
+      () => closingDb!.namespaces(), () => closingDb!.put('config_cache', [{ key: 'valid', payload: 'value' }]),
+      () => closingDb!.clearNamespace('config_cache'), () => closingDb!.reclaim(),
+    ]) assert.throws(operation, /HawdbClosed:/u);
+    closingDb = undefined;
+  }
+  const server = createServer(socket => {
+    let request = '';
+    socket.on('data', chunk => {
+      request += chunk.toString();
+      if (request.length < 4) return;
+      assert.equal(request, 'PING');
+      assert.equal(settled, false, 'socket must run while native work is pending');
+      assert.equal(existsSync(release), false);
+      socket.end('PONG');
+    });
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject); server.listen(0, '127.0.0.1', resolve);
+  });
+  try {
+    const address = server.address(); assert.ok(address && typeof address !== 'string');
+    process.stdout.write(`BARRIER ${address.port}\n`);
+    await new Promise<void>(resolve => setTimeout(() => {
+      assert.equal(settled, false, 'timer must run while native work is pending');
+      assert.equal(existsSync(release), false);
+      process.stdout.write('TIMER\n'); resolve();
+    }, 0));
+    if (role === 'lifecycle-close-gc') {
+      const gcRuntime = globalThis as typeof globalThis & { gc?: () => void; Bun?: { gc(full: boolean): void } };
+      const collect = gcRuntime.gc ?? (gcRuntime.Bun ? () => gcRuntime.Bun!.gc(true) : undefined);
+      if (collect) {
+        const deadline = Date.now() + 10_000;
+        for (;;) {
+          await new Promise(resolve => setTimeout(resolve, 0));
+          collect();
+          if (!weak!.deref()) break;
+          assert.ok(Date.now() < deadline, 'closing JS shell was not collected before release');
+        }
+        assert.equal(settled, false);
+        process.stdout.write('GC COLLECTED\n');
+      } else process.stdout.write('GC UNAVAILABLE\n');
+    }
+    const opened = await completion;
+    if (opened) {
+      try {
+        assert.deepEqual(opened.get('config_cache', ['async']), [{ key: 'async', payload: 'durable' }]);
+        opened.put('config_cache', [{ key: 'opened', payload: 'handoff' }]);
+      } finally { await opened.closeAsync(); }
+    }
+    const guard = acquireHawdbClearGuard(path, runtime); guard.verify(); guard.close();
+    process.stdout.write('DONE\n');
+  } finally { await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve())); }
+}
+
 const childRole = process.env.CONCORD_HAWDB_CHILD_ROLE;
 if (childRole) {
   const path = process.env.CONCORD_HAWDB_CHILD_PATH!;
+  if (childRole.startsWith('lifecycle-')) {
+    await lifecycleChild(childRole, path);
+    process.exit(0);
+  }
   if (childRole === 'fail-batch') {
     const db = openHawdb(path, { readOnly: false, create: false }, runtime);
     try {
@@ -119,6 +234,137 @@ if (childRole) {
   async function stop(proc: ChildProcess): Promise<void> {
     if (proc.exitCode !== null || proc.signalCode !== null) return;
     await new Promise<void>((resolve) => { proc.once('exit', () => resolve()); proc.kill('SIGTERM'); });
+  }
+
+  function lifecycleProcess(role: string, path: string, environment: Record<string, string>) {
+    const args = role === 'lifecycle-close-gc' && !process.versions.bun ? ['--expose-gc'] : [];
+    const proc = spawn(process.execPath, [...args, fileURLToPath(import.meta.url)], {
+      cwd: process.cwd(),
+      env: {
+        ...process.env, CONCORD_HAWDB_CHILD_ROLE: role, CONCORD_HAWDB_CHILD_PATH: path,
+        CONCORD_HAWDB_LIFECYCLE_WAIT: '', CONCORD_HAWDB_LIFECYCLE_FAILURE: '',
+        CONCORD_HAWDB_LIFECYCLE_READY: '', CONCORD_HAWDB_LIFECYCLE_RELEASE: '', ...environment,
+      },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let output = ''; let errors = ''; let spawnError: Error | undefined;
+    proc.stdout!.on('data', (chunk: Buffer) => { output += chunk.toString(); });
+    proc.stderr!.on('data', (chunk: Buffer) => { errors += chunk.toString(); });
+    proc.once('error', error => { spawnError = error; });
+    const exited = new Promise<number | null>(resolve => proc.once('exit', resolve));
+    return {
+      proc,
+      async line(prefix: string): Promise<string> {
+        const deadline = Date.now() + 15_000;
+        for (;;) {
+          const line = output.split('\n').find(line => line.startsWith(prefix) && output.includes(`${line}\n`));
+          if (line !== undefined) return line;
+          if (spawnError) throw spawnError;
+          assert.ok(proc.exitCode === null && proc.signalCode === null, `lifecycle child exited: ${output}\n${errors}`);
+          assert.ok(Date.now() < deadline, `lifecycle child missing ${prefix}: ${output}\n${errors}`);
+          await new Promise(resolve => setTimeout(resolve, 10));
+        }
+      },
+      async finish(): Promise<void> {
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        try {
+          const status = await Promise.race([
+            exited,
+            new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error(`lifecycle child stuck: ${output}\n${errors}`)), 15_000); }),
+          ]);
+          assert.equal(status, 0, output + errors);
+        } finally { clearTimeout(timer); }
+      },
+    };
+  }
+
+  async function ping(port: number): Promise<void> {
+    await new Promise<void>((resolve, reject) => {
+      const socket = createConnection({ host: '127.0.0.1', port });
+      const timer = setTimeout(() => socket.destroy(new Error('lifecycle socket did not respond')), 10_000);
+      let response = '';
+      socket.once('connect', () => socket.write('PING'));
+      socket.on('data', chunk => { response += chunk.toString(); });
+      socket.once('error', reject);
+      socket.once('close', () => {
+        clearTimeout(timer);
+        try { assert.equal(response, 'PONG'); resolve(); } catch (error) { reject(error); }
+      });
+    });
+  }
+
+  test('async native open hands off live durable data; async close releases cross-process ownership', async () => {
+    const f = fixture(); let db: Database | undefined; let proc: ChildProcess | undefined;
+    try {
+      const opening = native.openCache(f.db, false, true);
+      assert.ok(opening instanceof Promise);
+      db = await opening;
+      db.put('config_cache', [{ key: 'async', payload: 'durable' }]);
+      assert.deepEqual(db.get('config_cache', ['async']), [{ key: 'async', payload: 'durable' }]);
+      const closing = db.closeAsync(); assert.ok(closing instanceof Promise);
+      await closing; await db.closeAsync();
+      code(() => db!.get('config_cache', ['async']), 'HawdbClosed'); db = undefined;
+      proc = await child('guard', f.db);
+      await assert.rejects(native.openCache(f.db, false, false), /HawdbBusy:/u);
+      await stop(proc); proc = undefined;
+      db = await native.openCache(f.db, true, false);
+      assert.deepEqual(db.scan('config_cache'), [{ key: 'async', payload: 'durable' }]);
+      code(() => db!.put('config_cache', [{ key: 'x', payload: 'y' }]), 'HawdbIncompatible');
+      await db.closeAsync(); db = undefined;
+      const guard = acquireHawdbClearGuard(f.db, runtime); guard.verify(); guard.close();
+    } finally { if (proc) await stop(proc); if (db) await db.closeAsync(); f.cleanup(); }
+  });
+
+  if (hooks) for (const phase of ['open', 'close', 'close-gc'] as const) {
+    test(`async native ${phase} keeps timer/socket responsive and the lease busy until release`, async context => {
+      const f = fixture();
+      const ready = join(f.dir, 'lifecycle.ready'); const release = join(f.dir, 'lifecycle.release');
+      let worker: ReturnType<typeof lifecycleProcess> | undefined;
+      try {
+        const seed = openHawdb(f.db, { readOnly: false, create: true }, runtime);
+        seed.put('config_cache', [{ key: 'async', payload: 'durable' }]); seed.close();
+        worker = lifecycleProcess(`lifecycle-${phase}`, f.db, {
+          CONCORD_HAWDB_LIFECYCLE_WAIT: phase === 'open' ? 'open' : 'close',
+          CONCORD_HAWDB_LIFECYCLE_READY: ready, CONCORD_HAWDB_LIFECYCLE_RELEASE: release,
+        });
+        const barrier = await worker.line('BARRIER ');
+        assert.equal(existsSync(ready), true); assert.equal(existsSync(release), false);
+        await worker.line('TIMER');
+        await ping(Number(barrier.slice('BARRIER '.length)));
+        code(() => acquireHawdbClearGuard(f.db, runtime), 'HawdbBusy');
+        await assert.rejects(native.openCache(f.db, true, false), /HawdbBusy:/u);
+        if (phase === 'close-gc') {
+          const gc = await worker.line('GC ');
+          context.diagnostic(gc);
+          assert.match(gc, /^GC (COLLECTED|UNAVAILABLE)$/u);
+          // Collection must not cancel close or release the lease prematurely.
+          code(() => acquireHawdbClearGuard(f.db, runtime), 'HawdbBusy');
+        }
+        writeFileSync(release, 'release');
+        await worker.line('DONE'); await worker.finish();
+        const reopened = await native.openCache(f.db, true, false);
+        try {
+          assert.deepEqual(reopened.get('config_cache', ['async']), [{ key: 'async', payload: 'durable' }]);
+          if (phase === 'open') assert.deepEqual(reopened.get('config_cache', ['opened']), [{ key: 'opened', payload: 'handoff' }]);
+        } finally { await reopened.closeAsync(); }
+      } finally {
+        if (worker) { writeFileSync(release, 'cleanup'); await stop(worker.proc); }
+        f.cleanup();
+      }
+    });
+  }
+
+  if (hooks) for (const failure of ['open-before-wrap', 'open-after-wrap', 'open-unsettled', 'close-submit-failure']) {
+    test(`async native ${failure} drains custody before same-process guard/reopen`, async () => {
+      const f = fixture(); let worker: ReturnType<typeof lifecycleProcess> | undefined;
+      try {
+        const seed = openHawdb(f.db, { readOnly: false, create: true }, runtime);
+        seed.put('config_cache', [{ key: 'async', payload: 'durable' }]); seed.close();
+        worker = lifecycleProcess('lifecycle-failure', f.db, { CONCORD_HAWDB_LIFECYCLE_FAILURE: failure });
+        await worker.line('DRAINED'); await worker.finish();
+        const guard = acquireHawdbClearGuard(f.db, runtime); guard.verify(); guard.close();
+      } finally { if (worker) await stop(worker.proc); f.cleanup(); }
+    });
   }
 
   test('real native identity, durable reopen, parameterized special key, rollback, and close', () => {

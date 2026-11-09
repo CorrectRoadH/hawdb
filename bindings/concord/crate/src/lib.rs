@@ -7,13 +7,14 @@ use std::io::{self, Read};
 use std::num::NonZeroUsize;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Component, Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use hawdb::{
     value::{Value, ValueRef},
     Database, DatabaseConfig, HawDBError,
 };
-use napi::{Error, Status};
+use napi::bindgen_prelude::{AsyncTask, ClassInstance, JavaScriptClassExt, PromiseRaw};
+use napi::{Env, Error, ScopedTask, Status, Task};
 use napi_derive::napi;
 
 const REVISION: &str = "d47dd9b2b6a51c57a8a621367f5ff6d5d958b3e6";
@@ -596,10 +597,11 @@ struct Handle {
     writes: usize,
     churn: usize,
     poisoned: bool,
+    closing: bool,
 }
 #[napi]
 pub struct CacheBridge {
-    handle: Mutex<Handle>,
+    handle: Arc<Mutex<Handle>>,
 }
 #[napi]
 impl CacheBridge {
@@ -635,7 +637,7 @@ impl CacheBridge {
         }
         lease.verify()?;
         Ok(Self {
-            handle: Mutex::new(Handle {
+            handle: Arc::new(Mutex::new(Handle {
                 db: Some(db),
                 lease: Some(lease),
                 path: Some(path.to_owned()),
@@ -644,7 +646,8 @@ impl CacheBridge {
                 writes: 0,
                 churn: 0,
                 poisoned: false,
-            }),
+                closing: false,
+            })),
         })
     }
     #[napi(factory)]
@@ -652,7 +655,7 @@ impl CacheBridge {
         let mut db = Database::new_with_config(config(false));
         initialize(&mut db)?;
         Ok(Self {
-            handle: Mutex::new(Handle {
+            handle: Arc::new(Mutex::new(Handle {
                 db: Some(db),
                 lease: None,
                 path: None,
@@ -661,12 +664,13 @@ impl CacheBridge {
                 writes: 0,
                 churn: 0,
                 poisoned: false,
-            }),
+                closing: false,
+            })),
         })
     }
     #[napi]
     pub fn get(&self, namespace: String, keys: Vec<String>) -> napi::Result<Vec<CacheEntry>> {
-        let handle = self.handle.lock().map_err(unavailable)?;
+        let handle = self.ready()?;
         namespace_quota(&namespace, handle.memory)?;
         if keys.len() > 1000 {
             return Err(limit("get key batch exceeds 1000"));
@@ -704,7 +708,7 @@ impl CacheBridge {
     }
     #[napi]
     pub fn scan(&self, namespace: String) -> napi::Result<Vec<CacheEntry>> {
-        let handle = self.handle.lock().map_err(unavailable)?;
+        let handle = self.ready()?;
         namespace_quota(&namespace, handle.memory)?;
         let rows = read_rows(active(&handle)?, &namespace)?;
         Ok(rows
@@ -722,7 +726,7 @@ impl CacheBridge {
         entries: Vec<CacheEntry>,
         quota: Option<Quota>,
     ) -> napi::Result<()> {
-        let mut handle = self.handle.lock().map_err(unavailable)?;
+        let mut handle = self.ready()?;
         let (max_entries, max_bytes) = namespace_quota(&namespace, handle.memory)?;
         if handle.read_only {
             return Err(err("HawdbIncompatible", "database is read-only"));
@@ -846,7 +850,7 @@ impl CacheBridge {
     }
     #[napi]
     pub fn clear_namespace(&self, namespace: String) -> napi::Result<()> {
-        let mut handle = self.handle.lock().map_err(unavailable)?;
+        let mut handle = self.ready()?;
         namespace_quota(&namespace, handle.memory)?;
         if handle.read_only {
             return Err(err("HawdbIncompatible", "database is read-only"));
@@ -860,7 +864,7 @@ impl CacheBridge {
     }
     #[napi]
     pub fn namespaces(&self) -> napi::Result<Vec<String>> {
-        let handle = self.handle.lock().map_err(unavailable)?;
+        let handle = self.ready()?;
         let db = active(&handle)?;
         let mut result = Vec::new();
         for name in namespaces(handle.memory) {
@@ -872,7 +876,7 @@ impl CacheBridge {
     }
     #[napi]
     pub fn reclaim(&self) -> napi::Result<ReclamationReport> {
-        let mut handle = self.handle.lock().map_err(unavailable)?;
+        let mut handle = self.ready()?;
         if handle.memory || handle.read_only {
             return Err(err(
                 "HawdbIncompatible",
@@ -897,34 +901,217 @@ impl CacheBridge {
     }
     #[napi]
     pub fn close(&self) -> napi::Result<()> {
-        let mut handle = self.handle.lock().map_err(unavailable)?;
-        let mut db = handle.db.take();
-        let safe = handle.lease.as_ref().map(ConcordLease::verify).transpose();
-        let checkpoint = if safe.is_ok() && !handle.memory && !handle.read_only && !handle.poisoned
-        {
-            db.as_mut()
-                .map(|db| db.checkpoint())
-                .transpose()
-                .map(|_| ())
-                .map_err(unavailable)
-        } else {
-            Ok(())
+        self.ready()?.closing = true;
+        finish_close(&self.handle)
+    }
+
+    #[napi]
+    pub fn close_async<'env>(&self, env: &'env Env) -> napi::Result<PromiseRaw<'env, ()>> {
+        self.ready()?.closing = true;
+        let task = CloseTask {
+            handle: Arc::clone(&self.handle),
         };
-        drop(db);
-        let inspected = if safe.is_ok() && checkpoint.is_ok() {
-            handle
-                .path
-                .as_ref()
-                .map(|path| inspect_tree(path, false))
-                .transpose()
-                .map(|_| ())
+        // napi 3.13 may leak its task allocation when create/queue fails. Keep
+        // reachable custody here until submission is known to have succeeded.
+        let submitted = if lifecycle_failure("close-submit-failure") {
+            std::mem::forget(task);
+            Err(unavailable("injected async submission failure"))
         } else {
-            Ok(())
+            env.spawn(task)
         };
-        handle.lease = None;
-        safe.map(|_| ()).and(checkpoint).and(inspected)
+        match submitted {
+            Ok(work) => Ok(work.promise_object()),
+            Err(error) => {
+                let cleanup = finish_close(&self.handle);
+                cleanup.and(Err(error))
+            }
+        }
     }
 }
+impl CacheBridge {
+    fn ready(&self) -> napi::Result<MutexGuard<'_, Handle>> {
+        let handle = self.handle.lock().map_err(unavailable)?;
+        if handle.closing {
+            return Err(err("HawdbClosed", "cache handle is closing"));
+        }
+        Ok(handle)
+    }
+}
+
+// Resources leave the shared mutex before checkpoint, destruction, or I/O.
+// A leaked task or JS shell can retain this Arc, but cannot retain its database.
+fn finish_close(shared: &Arc<Mutex<Handle>>) -> napi::Result<()> {
+    finish_close_at_barrier(shared, false)
+}
+
+fn finish_close_at_barrier(shared: &Arc<Mutex<Handle>>, wait: bool) -> napi::Result<()> {
+    let mut owned = {
+        let mut handle = shared
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Handle {
+            db: handle.db.take(),
+            lease: handle.lease.take(),
+            path: handle.path.take(),
+            memory: handle.memory,
+            read_only: handle.read_only,
+            writes: 0,
+            churn: 0,
+            poisoned: handle.poisoned,
+            closing: true,
+        }
+    };
+    let barrier = if wait {
+        lifecycle_wait("close")
+    } else {
+        Ok(())
+    };
+    let result = close_owned(&mut owned);
+    shared
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .closing = false;
+    barrier.and(result)
+}
+
+fn close_owned(handle: &mut Handle) -> napi::Result<()> {
+    let mut db = handle.db.take();
+    let safe = handle.lease.as_ref().map(ConcordLease::verify).transpose();
+    let checkpoint = if safe.is_ok() && !handle.memory && !handle.read_only && !handle.poisoned {
+        db.as_mut()
+            .map(|db| db.checkpoint())
+            .transpose()
+            .map(|_| ())
+            .map_err(unavailable)
+    } else {
+        Ok(())
+    };
+    drop(db);
+    let inspected = if safe.is_ok() && checkpoint.is_ok() {
+        handle
+            .path
+            .as_ref()
+            .map(|path| inspect_tree(path, false))
+            .transpose()
+            .map(|_| ())
+    } else {
+        Ok(())
+    };
+    handle.lease = None;
+    safe.map(|_| ()).and(checkpoint).and(inspected)
+}
+
+pub struct OpenTask {
+    path: String,
+    read_only: bool,
+    create: bool,
+    custody: Option<Arc<Mutex<Handle>>>,
+    wrapped: bool,
+}
+
+impl Drop for OpenTask {
+    fn drop(&mut self) {
+        if let Some(shared) = self.custody.take() {
+            let _ = finish_close(&shared);
+        }
+    }
+}
+
+impl<'task> ScopedTask<'task> for OpenTask {
+    type Output = CacheBridge;
+    type JsValue = ClassInstance<'task, CacheBridge>;
+
+    fn compute(&mut self) -> napi::Result<Self::Output> {
+        let bridge = CacheBridge::new(self.path.clone(), self.read_only, self.create)?;
+        self.custody = Some(Arc::clone(&bridge.handle));
+        lifecycle_wait("open")?;
+        Ok(bridge)
+    }
+
+    fn resolve(&mut self, env: &'task Env, output: Self::Output) -> napi::Result<Self::JsValue> {
+        if lifecycle_failure("open-before-wrap") {
+            return Err(unavailable("injected before JS wrapping"));
+        }
+        let instance = output.into_instance(env)?;
+        if lifecycle_failure("open-after-wrap") {
+            return Err(unavailable("injected after JS wrapping"));
+        }
+        // finally also runs after a successful rejection: only an Ok resolve
+        // with a wrapped instance can authorize the ownership handoff.
+        self.wrapped = true;
+        Ok(instance)
+    }
+
+    fn finally(mut self, _env: Env) -> napi::Result<()> {
+        if self.wrapped && !lifecycle_failure("open-unsettled") {
+            self.custody = None;
+        }
+        Ok(())
+    }
+}
+
+#[napi]
+pub fn open_cache(path: String, read_only: bool, create: bool) -> AsyncTask<OpenTask> {
+    AsyncTask::new(OpenTask {
+        path,
+        read_only,
+        create,
+        custody: None,
+        wrapped: false,
+    })
+}
+
+struct CloseTask {
+    handle: Arc<Mutex<Handle>>,
+}
+impl Task for CloseTask {
+    type Output = ();
+    type JsValue = ();
+
+    fn compute(&mut self) -> napi::Result<()> {
+        finish_close_at_barrier(&self.handle, true)
+    }
+
+    fn resolve(&mut self, _env: Env, _output: ()) -> napi::Result<()> {
+        Ok(())
+    }
+}
+
+fn lifecycle_failure(stage: &str) -> bool {
+    #[cfg(feature = "test-hooks")]
+    {
+        std::env::var("CONCORD_HAWDB_LIFECYCLE_FAILURE").is_ok_and(|value| value == stage)
+    }
+    #[cfg(not(feature = "test-hooks"))]
+    {
+        let _ = stage;
+        false
+    }
+}
+
+fn lifecycle_wait(stage: &str) -> napi::Result<()> {
+    #[cfg(feature = "test-hooks")]
+    {
+        if std::env::var("CONCORD_HAWDB_LIFECYCLE_WAIT").is_ok_and(|value| value == stage) {
+            let ready = std::env::var_os("CONCORD_HAWDB_LIFECYCLE_READY")
+                .ok_or_else(|| unavailable("lifecycle ready path is required"))?;
+            let release = std::env::var_os("CONCORD_HAWDB_LIFECYCLE_RELEASE")
+                .ok_or_else(|| unavailable("lifecycle release path is required"))?;
+            fs::write(ready, stage).map_err(unavailable)?;
+            let start = std::time::Instant::now();
+            while !Path::new(&release).exists() {
+                if start.elapsed() > std::time::Duration::from_secs(30) {
+                    return Err(unavailable("lifecycle barrier timed out"));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
+    }
+    #[cfg(not(feature = "test-hooks"))]
+    let _ = stage;
+    Ok(())
+}
+
 #[cfg(feature = "test-hooks")]
 #[napi]
 impl CacheBridge {
@@ -942,7 +1129,7 @@ impl CacheBridge {
             schema(&db)?;
         }
         Ok(Self {
-            handle: Mutex::new(Handle {
+            handle: Arc::new(Mutex::new(Handle {
                 db: Some(db),
                 lease: None,
                 path: Some(path.to_owned()),
@@ -951,7 +1138,8 @@ impl CacheBridge {
                 writes: 0,
                 churn: 0,
                 poisoned: false,
-            }),
+                closing: false,
+            })),
         })
     }
 }

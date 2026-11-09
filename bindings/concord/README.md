@@ -102,6 +102,27 @@ bytes. No token, signing identity or upload capability is passed to build jobs.
 
 ## Local verification
 
+### Asynchronous handle lifecycle
+
+`native.openCache(path, readOnly, create): Promise<CacheBridge>` opens persistent
+storage on the official N-API worker pool. `CacheBridge.closeAsync(): Promise<void>`
+completes after database destruction and coordination-lease release. The existing
+synchronous constructor, memory constructor and data methods retain their contracts.
+During asynchronous close, valid data methods immediately fail with `HawdbClosed`;
+they must not wait for worker-held state. GC of the JS shell does not cancel an
+already submitted close. Normal open/close do database work off the event loop;
+wrapping or submission failure cleanup may drain resources synchronously.
+
+Open tasks retain custody until JS wrapping and successful handoff. Failed or
+unhanded-off opens drain the shared handle, dropping the database before its
+lease. Close submission failure similarly drains reachable shared state even if
+the underlying task allocation is leaked. These guarantees concern database and
+lease release; they do not claim to fix the pinned N-API dependency's allocation
+leaks. Concord separately owns Effect scope cancellation, owner serialization and
+the wrapper's shared close Promise.
+
+### Commands and acceptance scope
+
 Use Node 26.13.0, Bun 1.4.2, pnpm 11.18.0 and Rust 1.97.1. Install this package's
 own locked dependencies; no Concord checkout or node_modules is used:
 
@@ -133,9 +154,37 @@ local Nix-linked bytes deliberately have `portable: false` and cannot be release
 Both modes load **the final extracted archive bytes** in Node and Bun. Production
 proves native identity, durable reopen, parameterized data, quotas, atomic
 validation failure, mode restrictions, checkpointing, cross-process ownership,
-original inodes and unsafe-path refusal. Hook acceptance additionally proves
+original inodes and unsafe-path refusal, including real async open, live-handle
+handoff, durable data, async close and cross-process busy/reopen behavior.
+Hook acceptance additionally proves
 in-transaction rollback, SIGKILL/recovery and real raw/deferred owner/guard fences
-before and after nested lock removal. Tests require an explicit mode, validate
+before and after nested lock removal. Lifecycle children receive their hook
+environment before startup; tests never change it while native work is running:
+
+- `CONCORD_HAWDB_LIFECYCLE_WAIT=open|close`,
+  `CONCORD_HAWDB_LIFECYCLE_READY=<path>` and
+  `CONCORD_HAWDB_LIFECYCLE_RELEASE=<path>` pause the worker with its resource/lease
+  acquired. At this barrier, a timer and TCP socket must run, valid closing-handle
+  methods must report `HawdbClosed`, and another process must observe `HawdbBusy`.
+  Explicit release must allow completion, guard acquisition and durable reopen.
+  The native barrier has a 30-second failure ceiling; test deadlines detect hangs,
+  and are not latency or throughput requirements.
+- `CONCORD_HAWDB_LIFECYCLE_FAILURE=open-before-wrap|open-after-wrap|open-unsettled|close-submit-failure`
+  proves same-process guard acquisition and reopen after custody cleanup, before
+  process exit could release locks. `open-unsettled` simulates Task destruction
+  before handoff and may return a closed JS shell. It does not trigger a real
+  N-API settlement failure. `close-submit-failure` deliberately forgets the Task
+  to model a failed submission allocation leak; the JS entry still drains the
+  database and lease before reporting the named failure. These staged hooks do
+  not prove all actual N-API wrapping/settlement/submission error paths.
+- Closing-shell GC uses Node's `--expose-gc` or Bun's collector when available,
+  reports `GC COLLECTED` only after a WeakRef proves collection while close remains
+  pending, and then proves the lease survives until release. `GC UNAVAILABLE`
+  explicitly records a runtime without a collector; it is not GC evidence.
+
+For Concord's consumer runtime, replay both extracted modes with Bun 1.4.4 as
+well; the producer's pinned Bun 1.4.2 remains an independent acceptance lane.
+Tests require an explicit mode, validate
 the artifact and its license tree, and never silently skip native acceptance.
 Process-kill tests prove atomic process recovery, not hardware power-loss safety.
 Concord separately owns its full consumer suite, old-cache upgrade/rebuild,
