@@ -9,6 +9,11 @@ on:
         description: 'Official upstream semver (minimum 0.28.0); empty selects latest stable'
         required: false
         type: string
+      validate_only:
+        description: 'Build and test the current producer without publishing or reusing a release'
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -49,6 +54,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           UPSTREAM_VERSION: ${{ inputs.upstream_version }}
+          VALIDATE_ONLY: ${{ inputs.validate_only && 'true' || 'false' }}
         run: node bindings/concord/release.ts preflight
 
   prepare:
@@ -210,6 +216,7 @@ jobs:
 
   publish:
     needs: [preflight, prepare, freeze]
+    if: inputs.validate_only != true
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:

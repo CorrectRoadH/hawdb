@@ -316,12 +316,18 @@ test('full workflow rerun refuses draft and names original publish; complete pub
     host.failAfterUpload = 2;
     await assert.rejects(publishFrozen(host, f.candidate, frozen), /lost upload response/u);
     await assert.rejects(preflightRelease(host, selected), /DraftRequiresOriginalPublish: rerun publish job of run 123, artifact 456/u);
+    const draftReads = host.finds;
+    assert.equal(await preflightRelease(host, selected, true), true);
+    assert.equal(host.finds, draftReads, 'validation does not acquire or modify draft custody');
     assert.equal(host.uploads, 2);
     host.expired = true;
     await assert.rejects(preflightRelease(host, selected), /FrozenArtifactExpired: 456/u);
     host.expired = false; host.failAfterUpload = -1;
     await publishFrozen(host, f.candidate, frozen);
     assert.equal(await preflightRelease(host, selected), false);
+    const publicReads = host.finds;
+    assert.equal(await preflightRelease(host, selected, true), true);
+    assert.equal(host.finds, publicReads, 'validation builds current sources instead of reusing published bytes');
     assert.equal(host.uploads, 6);
   } finally { await f.cleanup(); }
 });

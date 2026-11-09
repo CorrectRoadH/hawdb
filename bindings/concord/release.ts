@@ -62,7 +62,8 @@ export async function verifyPublic(host: ReleaseHost, remote: RemoteRelease, exp
     return release;
   } finally { await rm(temp, { recursive: true, force: true }); }
 }
-export async function preflightRelease(host: ReleaseHost, selected: { version: string; revision: string }): Promise<boolean> {
+export async function preflightRelease(host: ReleaseHost, selected: { version: string; revision: string }, validateOnly = false): Promise<boolean> {
+  if (validateOnly) return true;
   const remote = await host.find(`hawdb-${selected.version}`);
   if (remote?.draft) {
     const f = parseProvenance(remote.body);
@@ -167,7 +168,8 @@ if (import.meta.main) {
   const main = attempt(async () => {
     if (process.argv[2] === 'preflight') {
       const selected = await selectUpstream(process.env.UPSTREAM_VERSION || undefined);
-      const build = await preflightRelease(githubHost, selected);
+      const mode = Schema.decodeUnknownSync(Schema.Literals(['true', 'false']))(process.env.VALIDATE_ONLY ?? 'false');
+      const build = await preflightRelease(githubHost, selected, mode === 'true');
       if (!process.env.GITHUB_OUTPUT) throw new Error('GitHubOutputMissing');
       await appendFile(process.env.GITHUB_OUTPUT, `version=${selected.version}\nrevision=${selected.revision}\nbuild=${build ? 'true' : 'false'}\n`);
     } else if (process.argv[2] === 'check-frozen') {

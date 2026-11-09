@@ -32,6 +32,13 @@ The release tag is exactly `hawdb-<upstream version>`, starting with
 output hashes establish integrity and provenance; versions own dependency and
 cache identity. Concord upgrades remain explicit dependency changes.
 
+Manual runs may set `validate_only=true` to build the current producer against
+the selected official engine even when that version already has a release.
+This mode runs both platform and runtime matrices and freezes the six candidate
+files as an Actions artifact; it never creates a tag, draft, or public release.
+Existing release assets and draft recovery remain untouched. A validation
+candidate is not an installable release pin and cannot replace published bytes.
+
 The two platforms are Linux x64 glibc on Ubuntu 24.04 and macOS arm64 on macOS 15
 with minimum deployment target 15.0. Each has production and test-hooks archives:
 

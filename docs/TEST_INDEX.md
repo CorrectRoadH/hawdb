@@ -24,6 +24,9 @@ Closing-shell WeakRef/GC evidence is reported separately when a collector exists
 The worker barrier's 30-second ceiling and test deadlines detect hangs, not
 performance regressions. Release-state tests use real archives and stub only GitHub custody, proving
 partial upload recovery, immutable asset conflicts and original-artifact expiry.
+Manual `validate_only` runs execute the same native lanes and freeze candidate
+artifacts without running the publish job. Preflight coverage checks that this
+mode neither reuses public bytes nor acquires an existing draft's custody.
 The package also checks real subprocess working-directory and output-limit behavior.
 Native fault injection is selected in each child process's startup environment,
 so Node and Bun exercise the same Rust hooks without runtime environment mutation.
