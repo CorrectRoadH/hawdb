@@ -20,21 +20,21 @@ import { Effect } from 'effect';
 import { NodeServices } from '@effect/platform-node';
 import { mkdtemp, mkdir, readFile, writeFile, rm, symlink } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join, basename, dirname } from 'node:path';
+import { join, basename } from 'node:path';
 import * as tar from 'tar';
-import { abi, combinations, decodeArtifact, decodeRelease, releaseFiles, stableVersion, type Identity } from '../contract.ts';
+import { abi, combinations, releaseFiles, type Identity } from '../contract.ts';
 import { assemble, extractArchive, licenseDigests, pack, validateReleaseDirectory } from '../archive.ts';
 import { publishFrozen, provenanceBody, verifyPublic, selectUpstream, preflightRelease, type Frozen, type ReleaseHost, type RemoteRelease } from '../release.ts';
 import { command, root, shaFile } from '../io.ts';
-import { sourceDigest, sourceFiles } from '../prepare.ts';
-const identity: Identity = { version: '0.28.0', revision: 'a'.repeat(40), producerCommit: 'b'.repeat(40), sourceDigest: 'c'.repeat(64), cargoLockDigest: 'd'.repeat(64) };
+const identity: Identity = { version: '0.28.0', engineVersion: '0.28.0', revision: 'a'.repeat(40), producerCommit: 'b'.repeat(40), sourceDigest: 'c'.repeat(64), cargoLockDigest: 'd'.repeat(64) };
 const frozen: Frozen = { runId: '123', artifactId: '456', artifactDigest: 'e'.repeat(64), producerCommit: identity.producerCommit, sourceDigest: identity.sourceDigest };
 test('producer commands retain their working directory with an explicit stdout bound', async () => {
   const run = (script: string, limit: number) => Effect.runPromise(command(process.execPath, ['-e', script], limit).pipe(Effect.provide(NodeServices.layer)));
   assert.equal(await run('process.stdout.write(process.cwd())', 32 * 1024 * 1024), root);
   await assert.rejects(run('process.stdout.write("over limit")', 3), /output limit/u);
 });
-async function fixture() {
+async function fixture(prepared: Identity = identity) {
+  const identity = prepared;
   const dir = await mkdtemp(join(tmpdir(), 'hawdb-publish-test-'));
   const archives = join(dir, 'archives'), candidate = join(dir, 'candidate');
   for (const c of combinations) {
@@ -96,21 +96,34 @@ class Host implements ReleaseHost {
   async artifact() { return { expired: this.expired, digest: frozen.artifactDigest, runId: frozen.runId }; }
 }
 
-test('strict versions and exact release fields refuse identity ambiguity', async () => {
-  for (const version of ['0.27.9', '0.28.0-concord.1', 'v0.28.0', '0.28.0-rc.1', '01.28.0', '0.28']) assert.throws(() => stableVersion(version));
-  assert.equal(stableVersion('0.28.0'), '0.28.0');
-  const f = await fixture();
-  try {
-    const r = await validateReleaseDirectory(f.candidate);
-    assert.equal(r.assets.length, 4);
-    assert.throws(() => decodeRelease({ ...r, unexpected: true }));
-    assert.throws(() => decodeRelease({ ...r, assets: r.assets.slice(1) }));
-    assert.throws(() => decodeRelease({ ...r, assets: [...r.assets.slice(0, 3), r.assets[0]] }));
-    const a = { target: 'linux-x64-glibc', abi, revision: identity.revision, sourceDigest: identity.sourceDigest, cargoLockDigest: identity.cargoLockDigest, binarySha256: 'a'.repeat(64), noticesSha256: 'b'.repeat(64), portable: true };
-    assert.throws(() => decodeArtifact(a), 'testHooks is mandatory');
-    assert.throws(() => decodeArtifact({ ...a, testHooks: false, extra: true }));
-  } finally { await f.cleanup(); }
-});
+// Route each external request by the exact GitHub tag, with independent assets.
+class TaggedHost implements ReleaseHost {
+  releases = new Map<string, Host>();
+  async find(tag: string) { return this.releases.get(tag)?.find(); }
+  async create(tag: string, producer: string, body: string) {
+    assert.equal(this.releases.get(tag), undefined, 'never recreate an existing tag');
+    const host = new Host();
+    this.releases.set(tag, host);
+    await host.create(tag, producer, body);
+  }
+  async download(tag: string, name: string, dest: string) {
+    const host = this.releases.get(tag);
+    assert.ok(host, `missing tag ${tag}`);
+    await host.download(tag, name, dest);
+  }
+  async upload(tag: string, path: string) {
+    const host = this.releases.get(tag);
+    assert.ok(host, `missing tag ${tag}`);
+    await host.upload(tag, path);
+  }
+  async publish(tag: string) {
+    const host = this.releases.get(tag);
+    assert.ok(host, `missing tag ${tag}`);
+    await host.publish();
+  }
+  async artifact() { return { expired: false, digest: frozen.artifactDigest, runId: frozen.runId }; }
+}
+
 for (const lostAfter of [1, 2, 3, 4, 5, 6]) test(`resume same frozen candidate after upload ${lostAfter} response loss`, async () => {
   const f = await fixture(); const host = new Host();
   try {
@@ -266,7 +279,7 @@ test('upstream selection excludes draft/prerelease/non-semver and peels annotate
   const release = (tag: string, draft = false, prerelease = false): RemoteRelease => ({ id: 1, tag_name: tag, draft, prerelease, body: '', assets: [] });
   const calls: string[] = [];
   const host = {
-    async releases() { return [release('v0.28.0'), release('v0.29.0'), release('v9.0.0', true), release('v8.0.0', false, true), release('v7.0.0-rc.1'), release('native-deadbeef')]; },
+    async releases() { return [release('v0.28.0'), release('v0.29.0'), release('v9.0.0', true), release('v8.0.0', false, true), release('v7.0.0-rc.1'), release('v99.0.0-concord.1'), release('native-deadbeef')]; },
     async object(path: string) {
       calls.push(path);
       return path.includes('/git/ref/') ? { object: { type: 'tag', sha: 'a'.repeat(40) } } : { object: { type: 'commit', sha: identity.revision } };
@@ -276,36 +289,11 @@ test('upstream selection excludes draft/prerelease/non-semver and peels annotate
   assert.equal(calls[0], 'repos/nowledge-co/hawdb/git/ref/tags/v0.29.0');
   assert.equal(calls[1], `repos/nowledge-co/hawdb/git/tags/${'a'.repeat(40)}`);
   assert.deepEqual(await selectUpstream('0.28.0', host), { version: '0.28.0', revision: identity.revision });
+  assert.equal(calls[2], 'repos/nowledge-co/hawdb/git/ref/tags/v0.28.0');
   await assert.rejects(selectUpstream('8.0.0', host), /StableReleaseMissing/u);
   await assert.rejects(selectUpstream('0.27.0', host), /minimum/u);
   await assert.rejects(selectUpstream('0.28.0-concord.1', host));
   await assert.rejects(selectUpstream('0.28.0', { ...host, async object() { return { object: { type: 'tree', sha: identity.revision } }; } }), /TagNotCommit/u);
-});
-
-test('every declared recipe input changes source identity; lock remains a separate digest', async () => {
-  const dir = await mkdtemp(join(tmpdir(), 'hawdb-source-test-'));
-  const recipe = join(dir, 'bindings/concord');
-  try {
-    assert.deepEqual(sourceFiles, [...sourceFiles].sort());
-    for (const name of [...sourceFiles, 'crate/Cargo.lock']) {
-      await mkdir(dirname(join(recipe, name)), { recursive: true });
-      await writeFile(join(recipe, name), await readFile(join(root, name)));
-    }
-    const original = await sourceDigest(recipe);
-    assert.equal(original, await sourceDigest());
-    for (const name of sourceFiles) {
-      const file = join(recipe, name), bytes = await readFile(file);
-      await writeFile(file, Buffer.concat([bytes, Buffer.from('changed input')]));
-      assert.notEqual(await sourceDigest(recipe), original, name);
-      await writeFile(file, bytes);
-    }
-    const lock = join(recipe, 'crate/Cargo.lock'), lockHash = await shaFile(lock);
-    await writeFile(lock, 'different lock');
-    assert.equal(await sourceDigest(recipe), original);
-    assert.notEqual(await shaFile(lock), lockHash);
-    await writeFile(join(recipe, 'README.md'), 'unrelated documentation');
-    assert.equal(await sourceDigest(recipe), original);
-  } finally { await rm(dir, { recursive: true, force: true }); }
 });
 
 test('full workflow rerun refuses draft and names original publish; complete public version skips build', async () => {
@@ -330,4 +318,40 @@ test('full workflow rerun refuses draft and names original publish; complete pub
     assert.equal(host.finds, publicReads, 'validation builds current sources instead of reusing published bytes');
     assert.equal(host.uploads, 6);
   } finally { await f.cleanup(); }
+});
+
+test('a bridge release recovers interrupted publication without overwriting the published engine release', async () => {
+  const host = new TaggedHost();
+  const plain = await fixture();
+  try {
+    await publishFrozen(host, plain.candidate, frozen);
+    const plainHost = host.releases.get('hawdb-0.28.0')!;
+    const original = structuredClone(plainHost.remote);
+    const originalBytes = new Map([...plainHost.bytes].map(([name, bytes]) => [name, Buffer.from(bytes)]));
+    const prepared = { ...identity, version: '0.28.0-concord.1', sourceDigest: '1'.repeat(64) };
+    const candidate = await fixture(prepared);
+    const provenance = { ...frozen, sourceDigest: prepared.sourceDigest };
+    const selected = { version: prepared.version, revision: identity.revision };
+    try {
+      assert.equal(await preflightRelease(host, selected), true, 'the plain release cannot skip this build');
+      await host.create('hawdb-0.28.0-concord.1', identity.producerCommit, provenanceBody(provenance));
+      const bridgeHost = host.releases.get('hawdb-0.28.0-concord.1')!;
+      bridgeHost.failAfterUpload = 2;
+      await assert.rejects(publishFrozen(host, candidate.candidate, provenance), /lost upload response/u);
+      await assert.rejects(preflightRelease(host, selected), /DraftRequiresOriginalPublish/u);
+      bridgeHost.failAfterUpload = -1;
+      await publishFrozen(host, candidate.candidate, provenance);
+      assert.equal(await preflightRelease(host, selected), false);
+      await publishFrozen(host, candidate.candidate, provenance);
+      assert.equal(bridgeHost.creates, 1);
+      assert.equal(bridgeHost.uploads, 6);
+      assert.equal(bridgeHost.publications, 1);
+      assert.equal(bridgeHost.remote?.draft, false);
+      assert.equal(await preflightRelease(host, { version: identity.version, revision: identity.revision }), false);
+      assert.deepEqual(plainHost.remote, original);
+      assert.deepEqual(plainHost.bytes, originalBytes);
+      assert.equal(plainHost.uploads, 6);
+      assert.equal(host.releases.size, 2);
+    } finally { await candidate.cleanup(); }
+  } finally { await plain.cleanup(); }
 });

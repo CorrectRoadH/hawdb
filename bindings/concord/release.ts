@@ -20,7 +20,7 @@ import { tmpdir } from 'node:os';
 import { setTimeout } from 'node:timers/promises';
 import { Effect, Schema } from 'effect';
 import { NodeRuntime, NodeServices } from '@effect/platform-node';
-import { decodeRelease, releaseFiles, repository, stableVersion, upstream, revision as revisionSchema, digest as digestSchema, type Release } from './contract.ts';
+import { decodeRelease, releaseFiles, repository, stableVersion, nativeVersion, upstream, revision as revisionSchema, digest as digestSchema, type Release } from './contract.ts';
 import { validateReleaseDirectory } from './archive.ts';
 import { attempt, command, shaFile } from './io.ts';
 
@@ -168,10 +168,11 @@ if (import.meta.main) {
   const main = attempt(async () => {
     if (process.argv[2] === 'preflight') {
       const selected = await selectUpstream(process.env.UPSTREAM_VERSION || undefined);
+      const version = nativeVersion(selected.version, process.env.BRIDGE_REVISION ?? '0');
       const mode = Schema.decodeUnknownSync(Schema.Literals(['true', 'false']))(process.env.VALIDATE_ONLY ?? 'false');
-      const build = await preflightRelease(githubHost, selected, mode === 'true');
+      const build = await preflightRelease(githubHost, { ...selected, version }, mode === 'true');
       if (!process.env.GITHUB_OUTPUT) throw new Error('GitHubOutputMissing');
-      await appendFile(process.env.GITHUB_OUTPUT, `version=${selected.version}\nrevision=${selected.revision}\nbuild=${build ? 'true' : 'false'}\n`);
+      await appendFile(process.env.GITHUB_OUTPUT, `version=${version}\nengine_version=${selected.version}\nrevision=${selected.revision}\nbuild=${build ? 'true' : 'false'}\n`);
     } else if (process.argv[2] === 'check-frozen') {
       const id = process.env.FROZEN_ARTIFACT_ID ?? '';
       if (!/^\d+$/u.test(id)) throw new Error('FrozenArtifactIdMissing');
@@ -181,7 +182,7 @@ if (import.meta.main) {
     } else if (process.argv[2] === 'publish') {
       const directory = resolve(process.argv[3] ?? 'candidate');
       const release = decodeRelease(JSON.parse(await readFile(join(directory, 'native-release.json'), 'utf8')));
-      for (const [field, variable] of [['version', 'EXPECTED_VERSION'], ['revision', 'EXPECTED_REVISION'], ['producerCommit', 'EXPECTED_PRODUCER_COMMIT'], ['sourceDigest', 'EXPECTED_SOURCE_DIGEST'], ['cargoLockDigest', 'EXPECTED_CARGO_LOCK_DIGEST']] as const) {
+      for (const [field, variable] of [['version', 'EXPECTED_VERSION'], ['engineVersion', 'EXPECTED_ENGINE_VERSION'], ['revision', 'EXPECTED_REVISION'], ['producerCommit', 'EXPECTED_PRODUCER_COMMIT'], ['sourceDigest', 'EXPECTED_SOURCE_DIGEST'], ['cargoLockDigest', 'EXPECTED_CARGO_LOCK_DIGEST']] as const) {
         if (!process.env[variable] || release[field] !== process.env[variable]) throw new Error(`CandidateWorkflowIdentityMismatch: ${field}`);
       }
       await publishFrozen(githubHost, directory, {

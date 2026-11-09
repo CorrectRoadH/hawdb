@@ -12,8 +12,9 @@ Concord's independent N-API producer is owned by
 the engine Cargo/Bazel graph. `release-binaries` owns the dedicated Ubuntu 24.04
 x64 glibc and macOS 15 arm64 lanes, production plus test-hooks, with identical
 repository-wide Cargo profiles. Each lane tests the final archived/extracted
-bytes under Node 26.13.0 and Bun 1.4.2; Concord consumer acceptance also replays
-both modes under Bun 1.4.4. Both modes cover async open/live handoff, durable data,
+bytes under the runtimes selected by the producer's `.node-version` and
+`.bun-version`; Concord consumer acceptance also replays both modes under the
+runtime selected by Concord's `.bun-version`. Both modes cover async open/live handoff, durable data,
 async close and cross-process busy/reopen. Hook acceptance includes transaction
 rollback, cross-process/raw/deferred ownership and SIGKILL recovery without
 skips, plus ready/release lifecycle barriers proving timer/TCP responsiveness,
@@ -24,6 +25,10 @@ Closing-shell WeakRef/GC evidence is reported separately when a collector exists
 The worker barrier's 30-second ceiling and test deadlines detect hangs, not
 performance regressions. Release-state tests use real archives and stub only GitHub custody, proving
 partial upload recovery, immutable asset conflicts and original-artifact expiry.
+A tag-scoped GitHub fake proves a bridge release can recover interrupted uploads
+and reuse its public assets while preserving the earlier plain engine release's
+metadata and bytes. Fixtures use real packing, assembly and directory validation;
+archive tests retain unsafe-entry refusal and payload-integrity checks.
 Manual `validate_only` runs execute the same native lanes and freeze candidate
 artifacts without running the publish job. Preflight coverage checks that this
 mode neither reuses public bytes nor acquires an existing draft's custody.

@@ -14,6 +14,11 @@ on:
         required: false
         type: boolean
         default: false
+      bridge_revision:
+        description: 'Bridge revision: 0 uses the upstream version; positive integers append -concord.N'
+        required: false
+        type: string
+        default: '0'
 
 permissions:
   contents: read
@@ -33,6 +38,7 @@ jobs:
     timeout-minutes: 15
     outputs:
       version: ${{ steps.select.outputs.version }}
+      engine_version: ${{ steps.select.outputs.engine_version }}
       revision: ${{ steps.select.outputs.revision }}
       build: ${{ steps.select.outputs.build }}
     steps:
@@ -54,6 +60,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           UPSTREAM_VERSION: ${{ inputs.upstream_version }}
+          BRIDGE_REVISION: ${{ inputs.bridge_revision || '0' }}
           VALIDATE_ONLY: ${{ inputs.validate_only && 'true' || 'false' }}
         run: node bindings/concord/release.ts preflight
 
@@ -83,12 +90,13 @@ jobs:
       - id: prepare
         name: Resolve one build copy and lock for both platforms
         env:
-          ENGINE_VERSION: ${{ needs.preflight.outputs.version }}
+          ENGINE_VERSION: ${{ needs.preflight.outputs.engine_version }}
+          RELEASE_VERSION: ${{ needs.preflight.outputs.version }}
           ENGINE_REVISION: ${{ needs.preflight.outputs.revision }}
           PRODUCER_COMMIT: ${{ github.sha }}
         run: |
           test "$(git rev-parse HEAD)" = "$PRODUCER_COMMIT"
-          node bindings/concord/prepare.ts "$ENGINE_VERSION" "$ENGINE_REVISION" "$PRODUCER_COMMIT"
+          node bindings/concord/prepare.ts "$ENGINE_VERSION" "$ENGINE_REVISION" "$PRODUCER_COMMIT" "$RELEASE_VERSION"
           tar --exclude=node_modules --exclude=target --exclude=dist --exclude=work -czf "$RUNNER_TEMP/prepared.tar.gz" bindings/concord
       - uses: actions/upload-artifact@v4
         with:
@@ -252,6 +260,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           EXPECTED_VERSION: ${{ needs.preflight.outputs.version }}
+          EXPECTED_ENGINE_VERSION: ${{ needs.preflight.outputs.engine_version }}
           EXPECTED_REVISION: ${{ needs.preflight.outputs.revision }}
           EXPECTED_PRODUCER_COMMIT: ${{ github.sha }}
           EXPECTED_SOURCE_DIGEST: ${{ needs.prepare.outputs.source_digest }}

@@ -5,11 +5,12 @@ own Concord's N-API bridge. Production Concord consumes released bytes and does
 not contain Rust sources, build tools, or a Cargo fallback. This package is not a
 production HawDB integration API and is not a member of the engine workspace.
 
-The bridge preserves `concord-hawdb-1`, table schema 1, parameterized SQL, namespace
+The bridge preserves its declared ABI and table schema, parameterized SQL, namespace
 and database budgets, atomic mutations, existing-only admission, original lock
-inodes, and the full-handle coordination lease. The initial engine is canonical upstream git
-`v0.28.0`, commit `d47dd9b2b6a51c57a8a621367f5ff6d5d958b3e6`, with default
-features disabled. N-API dependencies and libc are exact pins. Engine API drift
+inodes, and the full-handle coordination lease. The engine is canonical upstream
+git, with version and revision owned by `crate/Cargo.toml` and default features
+disabled. Toolchains, N-API dependencies and libc are selected by the runtime
+version files, manifests and locks. Engine API drift
 must fail compilation or behavioral acceptance; it is never assumed compatible.
 Both read-only and writable opens explicitly select strict recovery; upstream
 defaults cannot enable automatic WAL repair or prevent existing-only reads.
@@ -20,17 +21,23 @@ The trusted `CorrectRoadH/hawdb` main workflow commit owns bridge code, dependen
 pins, build/sign/archive recipes and the publishing program. The hourly
 `release-binaries` workflow also supports a manual upstream semver, defaulting to
 the latest official non-draft, non-prerelease release in `nowledge-co/hawdb`.
-Only plain semver at least `0.28.0` is admitted. Annotated tags are peeled to the
+Only plain semver supported by `contract.ts` is admitted. Annotated tags are peeled to the
 exact engine commit. Engine fetches use `nowledge-co/hawdb.git` directly, so
 future releases do not depend on fork-network commit availability or overwriting
 fork main. One Ubuntu preparation job updates the build copy's engine
 pin and Rust identity, refreshes Cargo.lock, then freezes that copy for both
 platforms. Subsequent metadata, lint and build operations use `--locked`.
 
-The release tag is exactly `hawdb-<upstream version>`, starting with
-`hawdb-0.28.0`. It has no bridge suffix or digest-derived version. Source and
-output hashes establish integrity and provenance; versions own dependency and
-cache identity. Concord upgrades remain explicit dependency changes.
+The release tag is exactly `hawdb-<release version>`. A release version is the
+official engine version with an optional `-concord.<positive integer>` bridge
+revision. The manual `bridge_revision`
+input defaults to `0` (no suffix); positive values have no leading zeroes.
+Scheduled runs use no suffix. A bridge revision changes neither the selected
+engine version nor its commit. Other prerelease suffixes and build metadata are
+refused. Source and output hashes establish integrity and provenance; the full
+release tag owns dependency and cache identity. Published tags and assets are
+immutable; a bridge change uses a new revision, never replacement bytes.
+Concord upgrades remain explicit dependency changes.
 
 Manual runs may set `validate_only=true` to build the current producer against
 the selected official engine even when that version already has a release.
@@ -57,15 +64,22 @@ gzip timestamps are zero. This does not claim reproducible Rust or signed bytes.
 
 Both macOS modes are signed by this producer with an ad-hoc identity and checked
 with `codesign --verify --strict`; their final signed bytes own the binary digest.
-No stripping is applied: Rust 1.97.1 stripping may corrupt Mach-O LINKEDIT.
+No stripping is applied because it may corrupt Mach-O LINKEDIT.
 Production and hooks both record mandatory boolean `testHooks`; installation must
 reject hooks. Portability describes linkage independently of test mode.
 
 `native-release.json` has exactly the v1 fields encoded in `contract.ts`: fixed
-repository, plain version and matching tag/engineVersion, producer commit, engine
+repository, release version and matching tag, plain engineVersion, producer commit, engine
 revision, ABI, source/lock digests and four target/mode assets with archive,
 binary and notice digests. `SHA256SUMS` covers these four archives and the JSON.
 There are exactly six release assets, with no executable publishing input in them.
+Removing the optional bridge suffix from `version` must yield `engineVersion`.
+The prepared identity records both fields; preparation receives engine version,
+engine commit, producer commit and an optional release version in that order.
+Only the engine version enters the Cargo dependency pin and upstream notice.
+Preflight exports separate `version` and `engine_version` outputs; preparation,
+freeze and publication bind both to the selected workflow inputs. A mismatched
+engine/release pair fails before compiling or publishing.
 
 ## Source custody and immutable recovery
 
@@ -130,8 +144,9 @@ the wrapper's shared close Promise.
 
 ### Commands and acceptance scope
 
-Use Node 26.13.0, Bun 1.4.2, pnpm 11.18.0 and Rust 1.97.1. Install this package's
-own locked dependencies; no Concord checkout or node_modules is used:
+Use the Node and Bun versions in this package's `.node-version` and `.bun-version`,
+the pnpm version in `package.json`, and Rust from `crate/rust-toolchain.toml`.
+Install this package's own locked dependencies; no Concord checkout or node_modules is used:
 
 ```sh
 pnpm --dir bindings/concord install --frozen-lockfile --ignore-scripts
@@ -145,7 +160,7 @@ To prepare the pinned version, use the actual trusted producer commit as the las
 argument (the workflow provides it from `github.sha`):
 
 ```sh
-node bindings/concord/prepare.ts 0.28.0 d47dd9b2b6a51c57a8a621367f5ff6d5d958b3e6 <producer-commit>
+node bindings/concord/prepare.ts <engine-version> <engine-commit> <producer-commit> <release-version>
 node bindings/concord/build.ts /tmp/hawdb-production
 node bindings/concord/archive.ts pack /tmp/hawdb-production /tmp/hawdb-archives linux-x64-glibc production
 node bindings/concord/archive.ts extract /tmp/hawdb-archives/hawdb-linux-x64-glibc.tar.gz /tmp/hawdb-extracted linux-x64-glibc
@@ -189,8 +204,9 @@ environment before startup; tests never change it while native work is running:
   pending, and then proves the lease survives until release. `GC UNAVAILABLE`
   explicitly records a runtime without a collector; it is not GC evidence.
 
-For Concord's consumer runtime, replay both extracted modes with Bun 1.4.4 as
-well; the producer's pinned Bun 1.4.2 remains an independent acceptance lane.
+For Concord's consumer runtime, replay both extracted modes with the Bun version
+in Concord's `.bun-version` as well; the producer's selected Bun remains an
+independent acceptance lane.
 Tests require an explicit mode, validate
 the artifact and its license tree, and never silently skip native acceptance.
 Process-kill tests prove atomic process recovery, not hardware power-loss safety.

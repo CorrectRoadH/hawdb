@@ -96,7 +96,7 @@ export async function assemble(input: string, output: string, identity: Identity
       await writeFile(join(output, name), await readFile(archive));
     } finally { await rm(scratch, { recursive: true, force: true }); }
   }
-  const release = decodeRelease({ format: 'concord.native-release/v1', repository: 'CorrectRoadH/hawdb', ...identity, tag: `hawdb-${identity.version}`, engineVersion: identity.version, abi, assets });
+  const release = decodeRelease({ format: 'concord.native-release/v1', repository: 'CorrectRoadH/hawdb', ...identity, tag: `hawdb-${identity.version}`, abi, assets });
   await writeFile(join(output, 'native-release.json'), `${JSON.stringify(release, null, 2)}\n`);
   const sums = await Promise.all(releaseFiles.filter(n => n !== 'SHA256SUMS').map(async name => `${await shaFile(join(output, name))}  ${name}\n`));
   await writeFile(join(output, 'SHA256SUMS'), sums.join(''));
